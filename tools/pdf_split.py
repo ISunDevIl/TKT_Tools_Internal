@@ -5,7 +5,7 @@ import shutil
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QFileDialog, QMessageBox, QScrollArea, QLineEdit, QFrame,
-    QInputDialog, QTextEdit, QGroupBox
+    QInputDialog, QTextEdit, QGroupBox, QGridLayout
 )
 from PyQt5.QtGui import QPixmap, QImage, QCursor
 from PyQt5.QtCore import Qt, QSize, QTimer
@@ -29,6 +29,8 @@ class PDFSplitterApp(QWidget):
         self.resize_timer.setSingleShot(True)
         self.resize_timer.timeout.connect(self._on_resize_timer)
         self.used_pages = set()
+        self.page_load_iterator = None
+        self.is_loading_more = False
         self.thumb_width = 280
         self.thumb_height = 360
 
@@ -74,8 +76,8 @@ class PDFSplitterApp(QWidget):
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.page_container = QWidget()
-        self.page_layout = QVBoxLayout(self.page_container)
-        self.page_layout.setAlignment(Qt.AlignTop)
+        self.page_layout = QGridLayout(self.page_container)
+        self.page_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.scroll_area.setWidget(self.page_container)
 
         # --- Bảng điều khiển bên phải ---
@@ -126,6 +128,58 @@ class PDFSplitterApp(QWidget):
         main_layout.addLayout(content_layout)
         self.setLayout(main_layout)
 
+    def _clear_grid_layout(self): # <--- THAY ĐỔI: Hàm helper mới
+        """Xóa tất cả widget khỏi grid layout."""
+        while self.page_layout.count():
+            child = self.page_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        self.page_labels.clear()
+
+    def _load_page_chunk(self):
+        # Lấy số cột hiện tại để thêm widget cho đúng
+        cols = max(1, (self.scroll_area.width() - 30) // (self.thumb_width + 20))
+        
+        # Mỗi lần chỉ xử lý 5 trang để tránh chặn giao diện
+        for _ in range(5):
+            try:
+                # Lấy trang tiếp theo từ danh sách cần tải
+                i = next(self.page_load_iterator)
+            except StopIteration:
+                # Nếu không còn trang nào, quá trình tải đã xong
+                self.is_loading_more = False
+                self.setEnabled(True)
+                QApplication.restoreOverrideCursor()
+                self.log("✅ Tải trang hoàn tất.")
+                return # Kết thúc
+
+            original_num = self.original_page_map[i]
+            if original_num in self.used_pages:
+                continue
+
+            page = self.doc[i]
+            pix = page.get_pixmap()
+            image = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
+            scaled_pixmap = QPixmap.fromImage(image).scaled(
+                self.thumb_width, self.thumb_height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            
+            label = QLabel()
+            label.setPixmap(scaled_pixmap)
+            label.setAlignment(Qt.AlignCenter)
+            label.setFixedSize(self.thumb_width + 10, self.thumb_height + 10)
+            label.setCursor(Qt.PointingHandCursor)
+            label.mousePressEvent = lambda e, num=i: self.page_clicked(num)
+
+            current_item_count = len(self.page_labels)
+            row = current_item_count // cols
+            col = current_item_count % cols
+            
+            self.page_labels[i] = label
+            self.page_layout.addWidget(label, row, col)
+            self.loaded_pages += 1
+
+        QTimer.singleShot(0, self._load_page_chunk)
+        
     def _load_pdf_data(self, file_path):
         """Hàm helper để tải và hiển thị dữ liệu từ một file PDF."""
         try:
@@ -156,50 +210,33 @@ class PDFSplitterApp(QWidget):
         self._reflow_grid_on_resize()
 
     def _reflow_grid_on_resize(self):
-        """Chỉ sắp xếp lại các widget đã hiển thị khi resize cửa sổ."""
-        if not self.doc or not self.page_labels:
+        """Sắp xếp lại các widget đã hiển thị trong grid khi resize cửa sổ."""
+        if not self.page_labels:
             return
 
         self.setEnabled(False)
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            scrollbar = self.scroll_area.verticalScrollBar()
-            old_scroll_value = scrollbar.value()
+            # 1. Lấy danh sách các widget đang hiển thị
+            visible_widgets = []
+            for i in sorted(self.page_labels.keys()):
+                label = self.page_labels[i]
+                if label.isVisible():
+                    visible_widgets.append(label)
 
-            old_rows = []
-            while self.page_layout.count():
-                row_widget = self.page_layout.takeAt(0).widget()
-                if row_widget:
-                    old_rows.append(row_widget)
-            
-            pages_per_row = max(1, (self.scroll_area.width() - 30) // (self.thumb_width + 20))
-            row_layout = None
-            
-            visible_indices = []
-            for i in range(self.loaded_pages):
-                original_num = self.original_page_map[i]
-                if original_num not in self.used_pages:
-                    visible_indices.append(i)
+            # 2. Xóa chúng khỏi layout (nhưng không xóa widget)
+            for widget in visible_widgets:
+                self.page_layout.removeWidget(widget)
 
-            for i, page_index in enumerate(visible_indices):
-                if i % pages_per_row == 0:
-                    row_widget = QWidget()
-                    row_layout = QHBoxLayout(row_widget)
-                    row_layout.setAlignment(Qt.AlignLeft)
-                    self.page_layout.addWidget(row_widget)
-                
-                label = self.page_labels.get(page_index)
-                if label and row_layout is not None:
-                    label.setParent(row_widget)
-                    row_layout.addWidget(label)
-            
-            if row_layout is not None:
-                row_layout.addStretch()
-
-            for row in old_rows:
-                row.deleteLater()
-
-            QTimer.singleShot(0, lambda: scrollbar.setValue(old_scroll_value))
+            # 3. Tính toán lại số cột và thêm lại widget vào grid
+            cols = max(1, (self.scroll_area.width() - 30) // (self.thumb_width + 20))
+            row, col = 0, 0
+            for widget in visible_widgets:
+                self.page_layout.addWidget(widget, row, col)
+                col += 1
+                if col >= cols:
+                    col = 0
+                    row += 1
         finally:
             self.setEnabled(True)
             QApplication.restoreOverrideCursor()
@@ -224,106 +261,34 @@ class PDFSplitterApp(QWidget):
             QApplication.restoreOverrideCursor()
 
     def check_scroll_position(self, value):
+        if self.is_loading_more:
+            return
+    
         scrollbar = self.scroll_area.verticalScrollBar()
-        if value >= scrollbar.maximum() - 300: 
+        if value >= scrollbar.maximum() - 600: 
             if self.loaded_pages < len(self.doc):
                 self.show_pages(more=True)
 
     def show_pages(self, more=False):
-        if not self.doc:
+        if not self.doc or self.is_loading_more:
             return
 
+        self.is_loading_more = True
         self.setEnabled(False)
         QApplication.setOverrideCursor(Qt.WaitCursor)
-        
-        try:
-            if not more:
-                while self.page_layout.count():
-                    child = self.page_layout.takeAt(0)
-                    if child.widget():
-                        child.widget().deleteLater()
-                self.loaded_pages = 0
-            
-            pages_per_row = max(1, (self.scroll_area.width() - 30) // (self.thumb_width + 20))
-            row_layout = None
-            
-            # Lấy row_layout cuối cùng nếu có để thêm trang vào tiếp
-            if self.page_layout.count() > 0:
-                last_row_widget = self.page_layout.itemAt(self.page_layout.count() - 1).widget()
-                if last_row_widget:
-                    row_layout = last_row_widget.layout()
-            
-            # Mục tiêu là hiển thị thêm khoảng 30 trang MỚI
-            pages_shown_this_run = 0
-            target_pages = 30
+        self.log("🔄 Bắt đầu tải trang...")
 
-            # Vòng lặp chính: Tiếp tục cho đến khi hiển thị đủ trang hoặc hết tài liệu
-            while pages_shown_this_run < target_pages and self.loaded_pages < len(self.doc):
-                
-                # Xác định lô tiếp theo để quét
-                start_scan_index = self.loaded_pages
-                end_scan_index = min(start_scan_index + 30, len(self.doc))
+        if not more:
+            self._clear_grid_layout()
+            self.loaded_pages = 0
 
-                for i in range(start_scan_index, end_scan_index):
-                    # Nếu đã hiển thị đủ trang trong lần chạy này thì dừng lại
-                    if pages_shown_this_run >= target_pages:
-                        break
+        # Tạo một "danh sách" các chỉ số trang cần được tải
+        start_scan_index = self.loaded_pages
+        pages_to_load = range(start_scan_index, len(self.doc))
+        self.page_load_iterator = iter(pages_to_load)
 
-                    original_num = self.original_page_map[i]
-                    if original_num in self.used_pages:
-                        continue  # Bỏ qua các trang đã tách
-
-                    # Đếm số widget trong hàng cuối để xác định khi nào cần tạo hàng mới
-                    widgets_in_current_row = 0
-                    if row_layout:
-                        # Trừ 1 nếu item cuối là stretch
-                        count = row_layout.count()
-                        if count > 0 and row_layout.itemAt(count - 1).spacerItem():
-                            widgets_in_current_row = count - 1
-                        else:
-                            widgets_in_current_row = count
-
-                    # Tạo hàng mới nếu hàng hiện tại đã đầy hoặc chưa có hàng nào
-                    if row_layout is None or widgets_in_current_row >= pages_per_row:
-                        row_widget = QWidget()
-                        row_layout = QHBoxLayout(row_widget)
-                        row_layout.setAlignment(Qt.AlignLeft)
-                        self.page_layout.addWidget(row_widget)
-
-                    # --- Tạo và hiển thị ảnh thumbnail ---
-                    page = self.doc[i]
-                    pix = page.get_pixmap()
-                    image = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
-                    scaled_pixmap = QPixmap.fromImage(image).scaled(
-                        self.thumb_width, self.thumb_height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-
-                    label = QLabel()
-                    label.setPixmap(scaled_pixmap)
-                    label.setAlignment(Qt.AlignCenter)
-                    label.setFixedSize(self.thumb_width + 10, self.thumb_height + 10)
-                    label.setCursor(Qt.PointingHandCursor)
-                    label.mousePressEvent = lambda e, num=i: self.page_clicked(num)
-                    
-                    self.page_labels[i] = label
-                    row_layout.addWidget(label)
-                    
-                    pages_shown_this_run += 1
-
-                # Cập nhật bộ đếm với số trang đã QUÉT qua
-                self.loaded_pages = end_scan_index
-            
-            # Thêm stretch vào hàng cuối cùng để căn lề trái
-            if row_layout is not None:
-                # Xóa stretch cũ đi nếu có
-                if row_layout.count() > 0 and row_layout.itemAt(row_layout.count() - 1).spacerItem():
-                    row_layout.takeAt(row_layout.count() - 1)
-                row_layout.addStretch()
-
-        except Exception as e:
-            self.log(f"❌ Lỗi khi hiển thị trang: {e}")
-        finally:
-            self.setEnabled(True)
-            QApplication.restoreOverrideCursor()
+        # Bắt đầu quá trình tải cụm đầu tiên
+        self._load_page_chunk()
 
     def toggle_manual_mode(self):
         self.manual_mode = not self.manual_mode
@@ -369,19 +334,24 @@ class PDFSplitterApp(QWidget):
         try:
             self.next_start_page_index = 0
             self.used_pages.clear()
-            self.page_labels.clear()
-            self.loaded_pages = 0
-
-            self.show_pages()
-
+            
+            # Hiện lại tất cả các trang đã bị ẩn
+            for label in self.page_labels.values():
+                if not label.isVisible():
+                    label.show()
+            
+            self._reflow_grid_on_resize() # Sắp xếp lại toàn bộ lưới
             self.reset_temp_dir() 
-
             self.log(f"🔄 Đã reset. Bắt đầu tách lại từ đầu.")
         finally:
             self.setEnabled(True)
             QApplication.restoreOverrideCursor()
 
     def page_clicked(self, page_num):
+        if self.is_loading_more:
+            self.log("⚠️ Vui lòng chờ quá trình tải trang hoàn tất trước khi tương tác.")
+            return
+        
         if self.delete_mode:
             self.delete_page(page_num)
             return
@@ -409,28 +379,21 @@ class PDFSplitterApp(QWidget):
             new_doc.save(new_path)
             self.split_count += 1
             
-            # --- Phần 2: Cập nhật trạng thái ---
+            # --- Phần 2: Cập nhật trạng thái và giao diện ---
             for i in range(start, end + 1):
                 original_num = self.original_page_map[i]
                 self.used_pages.add(original_num)
+                
+                label_to_hide = self.page_labels.get(i)
+                if label_to_hide:
+                    label_to_hide.hide()
             
             self.next_start_page_index = end + 1
+            
+            self._reflow_grid_on_resize()
+            QTimer.singleShot(50, self.check_if_more_pages_needed)
 
-            def refresh_and_check_lazy_load():
-                scrollbar = self.scroll_area.verticalScrollBar()
-                scrollbar.setValue(old_scroll_value)
-                # Nếu màn hình trống (thanh cuộn biến mất) và vẫn còn trang, tải thêm
-                if scrollbar.maximum() == 0 and self.loaded_pages < len(self.doc):
-                    self.show_pages(more=True)
-
-            # --- Phần 3: Làm mới toàn bộ giao diện ---
-            old_scroll_value = self.scroll_area.verticalScrollBar().value()
-            self.page_labels.clear()
-            self.loaded_pages = 0
-            self.show_pages() 
-            QTimer.singleShot(50, refresh_and_check_lazy_load)
-
-            # --- Phần 4: Ghi log ---
+            # --- Phần 3: Ghi log ---
             original_start = self.original_page_map[start]
             original_end = self.original_page_map[end]
             self.log(f"✂ Đã tách trang gốc {original_start+1} → {original_end+1}.")
@@ -439,9 +402,17 @@ class PDFSplitterApp(QWidget):
                 self.log("✅ Đã tách tất cả các trang.")
                 QMessageBox.information(self, "Hoàn tất", "Đã tách tất cả các trang!")
             else:
-                next_original_start = self.original_page_map[self.next_start_page_index]
-                self.log(f"Trang bắt đầu tiếp theo là trang gốc: {next_original_start + 1}")
-        
+                next_visible_index = self.next_start_page_index
+                while next_visible_index < len(self.doc) and self.original_page_map[next_visible_index] in self.used_pages:
+                    next_visible_index += 1
+                
+                if next_visible_index < len(self.doc):
+                    self.next_start_page_index = next_visible_index
+                    next_original_start = self.original_page_map[self.next_start_page_index]
+                    self.log(f"Trang bắt đầu tiếp theo là trang gốc: {next_original_start + 1}")
+
+            self.scroll_area.verticalScrollBar().setValue(0)
+
         except Exception as e:
             self.log(f"❌ Lỗi khi tách thủ công: {e}")
             QMessageBox.critical(self, "Lỗi", f"Đã có lỗi xảy ra: {e}")
@@ -449,6 +420,11 @@ class PDFSplitterApp(QWidget):
             self.setEnabled(True)
             QApplication.restoreOverrideCursor()
 
+    def check_if_more_pages_needed(self): 
+        scrollbar = self.scroll_area.verticalScrollBar()
+        if scrollbar.maximum() == 0 and self.loaded_pages < len(self.doc):
+             self.show_pages(more=True)
+             
     def save_results(self):
         if not os.listdir(self.temp_dir):
             QMessageBox.warning(self, "Lỗi", "Chưa có file nào được tách để lưu.")
@@ -509,38 +485,24 @@ class PDFSplitterApp(QWidget):
 
     def delete_page(self, page_num):
         if not self.doc: return
-
-        self.setEnabled(False)
-        QApplication.setOverrideCursor(Qt.WaitCursor)
+        
         try:
-            def refresh_and_check_lazy_load():
-                scrollbar = self.scroll_area.verticalScrollBar()
-                scrollbar.setValue(old_scroll_value)
-                if scrollbar.maximum() == 0 and self.loaded_pages < len(self.doc):
-                    self.show_pages(more=True)
+            label_to_hide = self.page_labels.get(page_num)
             
-            old_scroll_value = self.scroll_area.verticalScrollBar().value()
+            original_page_number = self.original_page_map[page_num]
+            self.doc.delete_page(page_num)
+            self.original_page_map.pop(page_num)
+
+            if label_to_hide:
+                label_to_hide.hide() 
             
             if page_num < self.next_start_page_index:
                 self.next_start_page_index -= 1
 
-            original_page_number = self.original_page_map[page_num]
-            self.doc.delete_page(page_num)
-            self.original_page_map.pop(page_num)
             self.log(f"✅ Đã xóa trang gốc {original_page_number + 1}. Tổng số trang còn lại: {len(self.doc)}.")
-            
-            self.page_labels.clear()
-            self.loaded_pages = 0
-            self.show_pages()
-            
-            QTimer.singleShot(50, refresh_and_check_lazy_load)
-
+            self._reflow_grid_on_resize()
         except Exception as e:
             self.log(f"❌ Lỗi khi xóa trang: {e}")
-            QMessageBox.critical(self, "Lỗi", f"Không thể xóa trang: {e}")
-        finally:
-            self.setEnabled(True)
-            QApplication.restoreOverrideCursor()
 
     def resizeEvent(self, event):
         self.thumb_width = max(150, self.scroll_area.width() // 3 - 30) 
@@ -579,7 +541,7 @@ class PDFSplitterApp(QWidget):
         self.setEnabled(False)
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            total_pages = len(self.doc)
+            total_original_pages = len(self.original_page_map)
             for i in range(self.range_layout.count()):
                 widget = self.range_layout.itemAt(i).widget()
                 if not widget: continue
@@ -588,35 +550,30 @@ class PDFSplitterApp(QWidget):
                 to_input = widget.layout().itemAt(1).widget()
                 
                 try:
-                    # Chuyển đổi sang số trang gốc để tách cho đúng
                     start_orig = int(from_input.text().strip()) - 1
                     end_orig = int(to_input.text().strip()) - 1
                     
-                    if not (0 <= start_orig <= end_orig < len(self.original_page_map) + len(self.doc) - len(self.original_page_map)) :
-                         raise ValueError("Số trang gốc không hợp lệ")
+                    if not (0 <= start_orig <= end_orig < total_original_pages):
+                        raise ValueError(f"Số trang phải nằm trong khoảng từ 1 đến {total_original_pages}")
 
                     new_doc = fitz.open()
                     
-                    # Lặp qua tài liệu hiện tại để tìm các trang gốc tương ứng
-                    pages_to_insert = []
-                    for page_idx, orig_idx in enumerate(self.original_page_map):
-                        if start_orig <= orig_idx <= end_orig:
-                            pages_to_insert.append(page_idx)
-                    
-                    if not pages_to_insert:
-                        self.log(f"⚠️ Không tìm thấy trang nào trong khoảng gốc {start_orig+1}-{end_orig+1} để tách.")
-                        continue
+                    pages_to_insert_indices = []
+                    for current_page_index, original_page_number in enumerate(self.original_page_map):
+                        if start_orig <= original_page_number <= end_orig:
+                            pages_to_insert_indices.append(current_page_index)
+                    for page_idx in pages_to_insert_indices:
+                        new_doc.insert_pdf(self.doc, from_page=page_idx, to_page=page_idx)
 
-                    new_doc.insert_pdf(self.doc, from_page=pages_to_insert[0], to_page=pages_to_insert[-1], start_at=0)
                     out_path = os.path.join(self.temp_dir, f"split_{count}.pdf")
                     new_doc.save(out_path)
                     self.log(f"✅ Tách khoảng gốc {start_orig+1} → {end_orig+1} thành file {os.path.basename(out_path)}")
                     count += 1
                 except ValueError as e:
-                    QMessageBox.warning(self, "Lỗi", f"Khoảng trang không hợp lệ: '{from_input.text()}' - '{to_input.text()}'. {e}")
+                    QMessageBox.warning(self, "Lỗi", f"Khoảng trang không hợp lệ: '{from_input.text()}' - '{to_input.text()}'.\n{e}")
                     self.log(f"⚠️ Khoảng trang không hợp lệ: {from_input.text()} - {to_input.text()}")
-                    break 
-            
+                    break
+
             if count > 1:
                 QMessageBox.information(self, "Hoàn tất", f"Đã tách thành công {count-1} file.")
         finally:
