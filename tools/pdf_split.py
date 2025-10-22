@@ -437,7 +437,7 @@ class PDFSplitterApp(QWidget):
         dir_path = os.path.dirname(self.pdf_path)
         
         base_name = os.path.splitext(os.path.basename(self.pdf_path))[0]
-        save_dir = os.path.join(dir_path, f"{base_name}_split")
+        save_dir = os.path.join(dir_path, base_name)
         
         counter = 1
         final_save_dir = save_dir
@@ -469,6 +469,32 @@ class PDFSplitterApp(QWidget):
         self.temp_dir = tempfile.mkdtemp()
         self.split_count = 1
     
+    def _update_ui_after_deletion(self, deleted_page_num):
+        """
+        Cập nhật UI hiệu quả sau khi xóa trang mà không cần tải lại toàn bộ.
+        """
+        if deleted_page_num in self.page_labels:
+            label_to_remove = self.page_labels.pop(deleted_page_num)
+            self.page_layout.removeWidget(label_to_remove)
+            label_to_remove.deleteLater()
+
+        new_page_labels = {}
+        sorted_keys = sorted(self.page_labels.keys())
+
+        for old_index in sorted_keys:
+            label = self.page_labels[old_index]
+            
+            if old_index > deleted_page_num:
+                new_index = old_index - 1
+                label.mousePressEvent = lambda e, num=new_index: self.page_clicked(num)
+                new_page_labels[new_index] = label
+            else:
+                new_page_labels[old_index] = label
+        
+        self.page_labels = new_page_labels
+
+        self._reflow_grid_on_resize()
+
     def toggle_delete_mode(self):
         self.delete_mode = not self.delete_mode
         if self.delete_mode:
@@ -500,7 +526,7 @@ class PDFSplitterApp(QWidget):
                 self.next_start_page_index -= 1
 
             self.log(f"✅ Đã xóa trang gốc {original_page_number + 1}. Tổng số trang còn lại: {len(self.doc)}.")
-            self._reflow_grid_on_resize()
+            self._update_ui_after_deletion(page_num)
         except Exception as e:
             self.log(f"❌ Lỗi khi xóa trang: {e}")
 
